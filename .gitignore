@@ -17,6 +17,7 @@
 .idea
 
 env
+.env
 dist
 
 nowplaying-on-typetalk

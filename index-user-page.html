@@ -1,0 +1,43 @@
+<html>
+    <head>
+    </head>
+    <body>
+        <h1>Logged in!!</h1>
+        <span>Already connected to spotify</span>
+        <div>
+            <h2>Typetalk</h2>
+            <div id="typetalk-status"></div>
+        </div>
+        <div>
+            <h2>Spotify</h2>
+            <div id="spotify-status"></div>
+        </div>
+
+        <script>
+            window.onload = function() {
+                var endpoints = ["/ping/typetalk", "/ping/spotify"] 
+                var providers = [{id: "typetalk-status"}, {id: "spotify-status"}]
+                Promise.all(endpoints.map(a => fetch(a).then(res => res.json()))).then(res => {
+                    let isPrepareOK = true
+                    for(let i = 0 ; i < res.length; i++) {
+                        const elm = document.getElementById(providers[i].id)
+                        isPrepareOK &= res[i].isConnected
+                        if(res[i].isConnected) {
+                            var connectedText = document.createElement('span');
+                            connectedText.innerText = "Connected!"
+                            elm.appendChild(connectedText)
+                        } else {
+                            var newlink = document.createElement('a');
+                            newlink.setAttribute('href', res[i].AuthURL)
+                            newlink.innerText = "Login"
+                            elm.appendChild(newlink)
+                        }
+                    }
+                    if(isPrepareOK) {
+                        fetch("/subscribe/start")
+                    }
+                })
+            }
+        </script>
+    </body>
+</html>

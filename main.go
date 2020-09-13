@@ -2,283 +2,203 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net"
 	"net/http"
 	"os"
-	"os/exec"
-	"os/signal"
 	"path/filepath"
-	"runtime"
-	"strings"
-	"syscall"
 	"time"
 	"unicode/utf8"
 
+	"github.com/dgrijalva/jwt-go"
+	"github.com/golang-migrate/migrate"
+	_ "github.com/golang-migrate/migrate/database/postgres"
+	_ "github.com/golang-migrate/migrate/source/file"
+	_ "github.com/mattes/migrate/source/file"
+
+	"github.com/joho/godotenv"
 	typetalk "github.com/nulab/go-typetalk/v3/typetalk/v1"
-	uuid "github.com/satori/go.uuid"
-	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
-	"github.com/typetalk-gadget/go-typetalk-token-source/source"
-	"github.com/vvatanabe/spotify-playing-stream/stream"
+	"github.com/urfave/cli"
 	"github.com/zmb3/spotify"
 	"golang.org/x/oauth2"
 )
 
-const (
-	cmdName     = "nowplaying-on-typetalk"
-	defaultPort = 18080
-
-	flagNameDebug                = "debug"
-	flagNameConfig               = "config"
-	flagNameTypetalkClientID     = "typetalk_client_id"
-	flagNameTypetalkClientSecret = "typetalk_client_secret"
-	flagNameTypetalkSpaceKey     = "typetalk_space_key"
-	flagNameSpotifyClientID      = "spotify_client_id"
-	flagNameSpotifyClientSecret  = "spotify_client_secret"
-	flagNameStatusEmoji          = "status_emoji"
-	flagNamePort                 = "port"
-	flagNameTopic                = "topic"
-
-	configNameTopics = "topics"
-)
-
-type Config struct {
-	Debug                bool   `mapstructure:"debug"`
-	TypetalkClientID     string `mapstructure:"typetalk_client_id"`
-	TypetalkClientSecret string `mapstructure:"typetalk_client_secret"`
-	TypetalkSpaceKey     string `mapstructure:"typetalk_space_key"`
-	SpotifyClientID      string `mapstructure:"spotify_client_id"`
-	SpotifyClientSecret  string `mapstructure:"spotify_client_secret"`
-	StatusEmoji          string `mapstructure:"status_emoji"`
-	Port                 int    `mapstructure:"port"`
-	Topics               []int  `mapstructure:"topics"`
-}
-
-var (
-	config Config
-	dotDir string
-)
+var debug = false
 
 func main() {
-
-	home, err := os.UserHomeDir()
+	err := godotenv.Load()
 	if err != nil {
-		printFatal("UserHomeDir:", err)
+		printInfo("There is no .env file")
 	}
 
-	dotDir = getDotDir(home)
-	err = os.MkdirAll(dotDir, 0700)
-	if err != nil {
-		printFatal("MkdirAll:", err)
-	}
-	defaultConfigFile := filepath.Join(dotDir, "config.yaml")
-	if !exists(defaultConfigFile) {
-		defaultConfigFile = filepath.Join(dotDir, "config.yml")
-		if !exists(defaultConfigFile) {
-			_, err = os.Create(defaultConfigFile)
-			if err != nil {
-				printFatal("Create:", err)
-			}
+	app := cli.NewApp()
 
-		}
-	}
-
-	rootCmd := &cobra.Command{
-		Use:     cmdName,
-		Run:     run,
-		Version: FmtVersion(),
-	}
-
-	flags := rootCmd.PersistentFlags()
-
-	flags.Bool(flagNameDebug, false, "debug mode")
-	flags.StringP(flagNameConfig, "c", defaultConfigFile, "config file path")
-	flags.String(flagNameTypetalkClientID, "", "typetalk client id [TYPETALK_CLIENT_ID]")
-	flags.String(flagNameTypetalkClientSecret, "", "typetalk client secret [TYPETALK_CLIENT_SECRET]")
-	flags.String(flagNameTypetalkSpaceKey, "", "typetalk space key [TYPETALK_SPACE_KEY]")
-	flags.String(flagNameSpotifyClientID, "", "spotify client id [SPOTIFY_CLIENT_ID]")
-	flags.String(flagNameSpotifyClientSecret, "", "spotify client secret [SPOTIFY_CLIENT_SECRET]")
-	flags.String(flagNameStatusEmoji, ":musical_note:", "typetalk status emoji [STATUS_EMOJI]")
-	flags.Int(flagNamePort, defaultPort, "port number for OAuth")
-	flags.StringSlice(flagNameTopic, nil, "topic ID to post")
-
-	_ = viper.BindPFlag(flagNameDebug, flags.Lookup(flagNameDebug))
-	_ = viper.BindPFlag(flagNameTypetalkClientID, flags.Lookup(flagNameTypetalkClientID))
-	_ = viper.BindPFlag(flagNameTypetalkClientSecret, flags.Lookup(flagNameTypetalkClientSecret))
-	_ = viper.BindPFlag(flagNameTypetalkSpaceKey, flags.Lookup(flagNameTypetalkSpaceKey))
-	_ = viper.BindPFlag(flagNameSpotifyClientID, flags.Lookup(flagNameSpotifyClientID))
-	_ = viper.BindPFlag(flagNameSpotifyClientSecret, flags.Lookup(flagNameSpotifyClientSecret))
-	_ = viper.BindPFlag(flagNameStatusEmoji, flags.Lookup(flagNameStatusEmoji))
-	_ = viper.BindPFlag(flagNamePort, flags.Lookup(flagNamePort))
-	_ = viper.BindPFlag(configNameTopics, flags.Lookup(flagNameTopic))
-
-	cobra.OnInitialize(func() {
-		configFile, err := flags.GetString(flagNameConfig)
-		if err != nil {
-			printFatal(err)
-		}
-		viper.SetConfigFile(configFile)
-		viper.SetConfigType("yaml")
-		// viper.SetEnvPrefix(envPrefix)
-		viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
-		viper.AutomaticEnv()
-		if err := viper.ReadInConfig(); err != nil {
-			printFatal("failed to read config", err)
-		}
-
-		if err := viper.Unmarshal(&config); err != nil {
-			printFatal("failed to unmarshal config", err)
-		}
-	})
-
-	if err := rootCmd.Execute(); err != nil {
-		printFatal(err)
-	}
-}
-
-var (
-	// redirectURI is the OAuth redirect URI for the application.
-	// You must register an application at Spotify's developer portal
-	// and enter this value.
-	// http://localhost:18080/nowplaying-on-typetalk
-	redirectURI string
-	auth        spotify.Authenticator
-	state       = uuid.NewV4().String()
-	ch          = make(chan *spotify.Client)
-)
-
-func run(c *cobra.Command, args []string) {
-
-	// printDebug(fmt.Sprintf("config: %#v\n", config))
-
-	redirectURI = fmt.Sprintf("http://localhost:%d/%s", config.Port, cmdName)
-	auth = spotify.NewAuthenticator(redirectURI, spotify.ScopeUserReadCurrentlyPlaying)
-	auth.SetAuthInfo(config.SpotifyClientID, config.SpotifyClientSecret)
-
-	var sc *spotify.Client
-	defer func() {
-		if sc == nil {
-			return
-		}
-		tok, err := sc.Token()
-		if err != nil {
-			printError(err)
-			return
-		}
-		err = saveSpotifyTokenToFile(dotDir, tok)
-		if err != nil {
-			printError(err)
-			return
-		}
-	}()
-
-	if tok, err := getSpotifyTokenFromFile(dotDir); err != nil {
-		printInfo(err)
-	} else {
-		sc, err = newSpotify(&auth, tok)
-		if err != nil {
-			printError(err)
-		}
-	}
-
-	if sc == nil {
-		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", config.Port))
-		if err != nil {
-			printFatal(err)
-		}
-
-		// first start an HTTP server
-		mux := http.NewServeMux()
-		// pattern /nowplaying-on-typetalk
-		mux.HandleFunc("/"+cmdName, completeAuth)
-		srv := http.Server{
-			Handler: mux,
-		}
-		go func() {
-			err := srv.Serve(ln)
-			if err != nil && err != http.ErrServerClosed {
-				printError(err)
-			}
-		}()
-
-		authURL := auth.AuthURL(state)
-		err = openBrowser(authURL)
-		if err != nil {
-			printFatal(err)
-		}
-
-		printDebug("Logged in to Spotify by visiting the following page in your browser:", authURL)
-
-		// wait for auth to complete
-		sc = <-ch
-
-		go func() {
-			err := srv.Shutdown(context.Background())
-			if err != nil {
-				printError(err)
-			}
-			ln.Close()
-		}()
-	}
-
-	tc := newTypetalk(config.TypetalkClientID, config.TypetalkClientSecret, "my topic.post")
-
-	sps := stream.Stream{
-		Conn: sc,
-		Handler: &handler{
-			tc:       tc,
-			spaceKey: config.TypetalkSpaceKey,
-			emoji:    config.StatusEmoji,
-			topics:   config.Topics,
+	app.Flags = []cli.Flag{
+		cli.StringFlag{
+			Name:   "PORT",
+			EnvVar: "PORT",
+			Value:  "18080",
+			Usage:  "Web app port",
 		},
-		LoggerFunc: printError,
+		cli.StringFlag{
+			Name:   "TYPETALK_CLIENT_ID",
+			EnvVar: "TYPETALK_CLIENT_ID",
+			Value:  "",
+			Usage:  "Typetalk's client id for oauth2",
+		},
+		cli.StringFlag{
+			Name:   "TYPETALK_SECRET_KEY",
+			EnvVar: "TYPETALK_SECRET_KEY",
+			Value:  "",
+			Usage:  "Typetalk's secret key for oauth2",
+		},
+		cli.StringFlag{
+			Name:   "TYPETALK_REDIRECT_URL",
+			EnvVar: "TYPETALK_REDIRECT_URL",
+			Value:  "http://localhost:18080/callback/typetalk",
+			Usage:  "Callback endpoint for typetalk's oauth2",
+		},
+		cli.StringFlag{
+			Name:   "SPOTIFY_CLIENT_ID",
+			EnvVar: "SPOTIFY_CLIENT_ID",
+			Value:  "",
+			Usage:  "Spotify's client id for oauth2",
+		},
+		cli.StringFlag{
+			Name:   "SPOTIFY_SECRET_KEY",
+			EnvVar: "SPOTIFY_SECRET_KEY",
+			Value:  "",
+			Usage:  "Spotify's secret key for oauth2",
+		},
+		cli.StringFlag{
+			Name:   "SPOTIFY_REDIRECT_URL",
+			EnvVar: "SPOTIFY_REDIRECT_URL",
+			Value:  "http://localhost:18080/callback/spotify",
+			Usage:  "Callback endpoint for typetalk's oauth2",
+		},
+		cli.StringFlag{
+			Name:   "DATABASE_URL",
+			EnvVar: "DATABASE_URL",
+			Value:  "postgres://postgres:postgres@localhost:5432/nowonplaying?sslmode=disable",
+			Usage:  "DB user",
+		},
+		cli.StringFlag{
+			Name:   "JWT_SECRET",
+			EnvVar: "JWT_SECRET",
+			Value:  "secret",
+			Usage:  "The secret of JWT",
+		},
 	}
 
-	go func() {
-		printInfo("start to subscribe spotify playing stream")
-		err := sps.Subscribe()
+	app.Action = func(ctx *cli.Context) error {
+		// Update to the latest database state
+		m, err := migrate.New(
+			"file://./db/migration",
+			ctx.String("DATABASE_URL"))
+
 		if err != nil {
-			printError(err)
+			printFatal(err)
 		}
-	}()
 
-	sigint := make(chan os.Signal, 1)
-	signal.Notify(sigint, os.Interrupt, syscall.SIGTERM)
+		if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+			printFatal(err)
+		}
 
-	<-sigint
+		db, err := sql.Open("postgres", ctx.String("DATABASE_URL"))
 
-	printInfo("received a signal of graceful shutdown")
+		if err != nil {
+			printFatal(err, "Cannot connect to postgesql. it didn't launch")
+			return err
+		}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	err := sps.Shutdown(ctx)
-	if err != nil {
-		printError("failed to graceful shutdown", err)
-		return
+		typetalkAuth := NewAuthenticator(ctx.String("TYPETALK_CLIENT_ID"), ctx.String("TYPETALK_SECRET_KEY"), ctx.String("TYPETALK_REDIRECT_URL"), "my")
+
+		spotifyAuth := spotify.NewAuthenticator(ctx.String("SPOTIFY_REDIRECT_URL"), spotify.ScopeUserReadCurrentlyPlaying)
+		spotifyAuth.SetAuthInfo(ctx.String("SPOTIFY_CLIENT_ID"), ctx.String("SPOTIFY_SECRET_KEY"))
+
+		store := NewStore(db)
+		handlers := NewHandlers(typetalkAuth, spotifyAuth, ctx.String("JWT_SECRET"), &store)
+
+		authMid := authMiddleware(ctx.String("JWT_SECRET"))
+
+		http.HandleFunc("/", authMid(http.HandlerFunc(handlers.Top)))
+		// Typetalk callback
+		http.HandleFunc("/callback/typetalk", handlers.TypetalkCallbackHandler)
+		// Spotify callback
+		http.HandleFunc("/callback/spotify", authMid(http.HandlerFunc(handlers.SpotifyCallbackHandler)))
+
+		// Start subscribe spotify stream
+		http.HandleFunc("/subscribe/start", authMid(http.HandlerFunc(handlers.StartSubscribe)))
+
+		http.HandleFunc("/ping/spotify", authMid(http.HandlerFunc(handlers.CheckConnectionSpotify)))
+		http.HandleFunc("/ping/typetalk", authMid(http.HandlerFunc(handlers.CheckConnectionTypetalk)))
+
+		port := ctx.String("PORT")
+		printInfo("Server is running on", fmt.Sprintf("http://localhost:%s", port))
+		http.ListenAndServe(fmt.Sprintf(":%s", port), nil)
+
+		return nil
 	}
-	printInfo("completed graceful shutdown")
-
+	err = app.Run(os.Args)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
-func getSpotifyTokenFromFile(dir string) (*oauth2.Token, error) {
-	blob, err := ioutil.ReadFile(filepath.Join(dir, "spotify"))
-	if err != nil {
-		return nil, err
+type contextKey struct {
+	name string
+}
+
+// context key for user id
+var userCtxKey = &contextKey{"user"}
+
+// Middleware decodes the share session cookie and packs the session into context
+func authMiddleware(jwtSecret string) func(http.Handler) http.HandlerFunc {
+	return func(next http.Handler) http.HandlerFunc {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cookie, err := r.Cookie("session-token")
+
+			// when cookie is empty, it replaces to empty cookie
+			if err == http.ErrNoCookie {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			tokenString := cookie.Value
+			token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+					return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+				}
+				return []byte(jwtSecret), nil
+			})
+
+			if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+				// put it in context
+				ctx := context.WithValue(r.Context(), userCtxKey, claims["user_id"])
+
+				// and call the next with our new context
+				r = r.WithContext(ctx)
+			} else {
+				cookie := &http.Cookie{
+					Name:    sessionName,
+					Value:   "",
+					Path:    "/",
+					Expires: time.Unix(0, 0),
+				}
+				http.SetCookie(w, cookie)
+			}
+
+			next.ServeHTTP(w, r)
+		})
 	}
-	var token oauth2.Token
-	err = json.Unmarshal(blob, &token)
-	if err != nil {
-		return nil, err
-	}
-	if token.Expiry.Before(time.Now()) {
-		return nil, errors.New("expired token")
-	}
-	return &token, nil
+}
+
+func ForContext(ctx context.Context) int {
+	raw, _ := ctx.Value(userCtxKey).(float64)
+	return int(raw)
 }
 
 func saveSpotifyTokenToFile(dir string, token *oauth2.Token) error {
@@ -287,16 +207,6 @@ func saveSpotifyTokenToFile(dir string, token *oauth2.Token) error {
 		return err
 	}
 	return ioutil.WriteFile(filepath.Join(dir, "spotify"), blob, 0644)
-}
-
-func newTypetalk(clientID, clientSecret, scope string) *typetalk.Client {
-	tokenSource := &source.TokenSource{
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-		Scope:        scope,
-	}
-	oc := oauth2.NewClient(context.Background(), tokenSource)
-	return typetalk.NewClient(oc)
 }
 
 func newSpotify(auth *spotify.Authenticator, token *oauth2.Token) (*spotify.Client, error) {
@@ -311,13 +221,14 @@ func newSpotify(auth *spotify.Authenticator, token *oauth2.Token) (*spotify.Clie
 	return &c, nil
 }
 
-type handler struct {
-	tc              *typetalk.Client
-	spaceKey, emoji string
-	topics          []int
+type SpotifyStreamHandler struct {
+	tc        *typetalk.Client
+	emoji     string
+	spaceKeys []string
+	topics    []int
 }
 
-func (h *handler) Serve(playing *spotify.CurrentlyPlaying) {
+func (h *SpotifyStreamHandler) Serve(playing *spotify.CurrentlyPlaying) {
 	if len(h.topics) > 0 {
 		for _, topicID := range h.topics {
 			h.postTopic(topicID, playing)
@@ -333,18 +244,22 @@ func (h *handler) Serve(playing *spotify.CurrentlyPlaying) {
 	// eg. Retarded/KID FRESINO https://open.spotify.com/track/6aOaB0vl2ilHxRb23Wiazv
 	msg := fmt.Sprintf("%s %s", metadata, externalURL)
 	printDebug("NOW PLAYING", "-", msg)
-	_, _, err := h.tc.Statuses.SaveUserStatus(context.Background(),
-		h.spaceKey, h.emoji, &typetalk.SaveUserStatusOptions{
-			Message:                msg,
-			ClearAt:                "",
-			IsNotificationDisabled: false,
-		})
-	if err != nil {
-		printError(err)
+
+	for _, v := range h.spaceKeys {
+		_, _, err := h.tc.Statuses.SaveUserStatus(context.Background(),
+			v, ":musical_note:", &typetalk.SaveUserStatusOptions{
+				Message:                msg,
+				ClearAt:                "",
+				IsNotificationDisabled: false,
+			})
+		if err != nil {
+			printError(err)
+		}
+
 	}
 }
 
-func (h *handler) postTopic(topicID int, playing *spotify.CurrentlyPlaying) {
+func (h *SpotifyStreamHandler) postTopic(topicID int, playing *spotify.CurrentlyPlaying) {
 	// eg. https://open.spotify.com/track/6aOaB0vl2ilHxRb23Wiazv
 	externalURL := playing.Item.ExternalURLs["spotify"]
 	// eg. Retarded/KID FRESINO - ai qing [ ](https://i.scdn.co/image/ab67616d0000b273b3ca13afd5b1315924854ce7)
@@ -387,55 +302,8 @@ func generateMetadata(playing *spotify.CurrentlyPlaying, opt *metadataOption) st
 	return meta
 }
 
-func completeAuth(w http.ResponseWriter, r *http.Request) {
-	tok, err := auth.Token(state, r)
-	if err != nil {
-		http.Error(w, "Couldn't get token", http.StatusForbidden)
-		printFatal(err)
-	}
-	if st := r.FormValue("state"); st != state {
-		http.NotFound(w, r)
-		printFatal("State mismatch: %s != %s\n", st, state)
-	}
-	// use the token to get an authenticated client
-	c, err := newSpotify(&auth, tok)
-	if err != nil {
-		http.Error(w, "Couldn't connect spotify api", http.StatusForbidden)
-		printFatal(err)
-	}
-	fmt.Fprintf(w, "Login completed. You can close this tab.")
-	ch <- c
-}
-
-func openBrowser(url string) error {
-	var err error
-	switch runtime.GOOS {
-	case "linux":
-		err = exec.Command("xdg-open", url).Start()
-	case "windows":
-		err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
-	case "darwin":
-		err = exec.Command("open", url).Start()
-	default:
-		err = fmt.Errorf("unsupported platform")
-	}
-	return err
-}
-
-func exists(filename string) bool {
-	_, err := os.Stat(filename)
-	return err == nil
-}
-
-func getDotDir(home string) string {
-	if dir, exist := os.LookupEnv("XDG_CONFIG_HOME"); dir != "" && exist {
-		return filepath.Join(dir, cmdName)
-	}
-	return filepath.Join(home, "."+cmdName)
-}
-
 func printDebug(args ...interface{}) {
-	if config.Debug {
+	if debug {
 		args = append([]interface{}{"[DEBUG]"}, args...)
 		log.Println(args...)
 	}

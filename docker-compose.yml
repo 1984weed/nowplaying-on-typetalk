@@ -1,0 +1,18 @@
+version: "3.7"
+
+volumes:
+  nowplaying.on.typetalk.volume:
+
+services:
+    nowplayin_on_typetalk.db:
+        image: postgres:11.5-alpine
+        container_name: nowplayin_on_typetalk.db
+        ports:
+            - 5432:5432
+        volumes:
+            - nowplaying.on.typetalk.volume:/var/lib/postgresql/data
+        environment:
+            POSTGRES_USER: postgres
+            POSTGRES_PASSWORD: postgres
+            POSTGRES_DB: nowonplaying
+        restart: always
