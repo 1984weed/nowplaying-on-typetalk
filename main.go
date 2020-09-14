@@ -20,6 +20,7 @@ import (
 	_ "github.com/mattes/migrate/source/file"
 
 	"github.com/joho/godotenv"
+	"github.com/nulab/go-typetalk/typetalk/shared"
 	typetalk "github.com/nulab/go-typetalk/v3/typetalk/v1"
 	"github.com/urfave/cli"
 	"github.com/zmb3/spotify"
@@ -120,7 +121,50 @@ func main() {
 		spotifyAuth.SetAuthInfo(ctx.String("SPOTIFY_CLIENT_ID"), ctx.String("SPOTIFY_SECRET_KEY"))
 
 		store := NewStore(db)
-		handlers := NewHandlers(typetalkAuth, spotifyAuth, ctx.String("JWT_SECRET"), &store)
+
+		generator := Generator{
+			NewSpotifyClient: func(token *oauth2.Token, sa SpotifyAuthenticator) SpotifyAPIClient {
+				client := sa.NewClient(token)
+				return &client
+			},
+			NewTypetalkClient: func(token *oauth2.Token, ta TypetalkAuthenticator) TypetalkAPIClient {
+				return &typetalkApiClient{
+					client: ta.NewClient(token),
+				}
+			},
+			NewSpotifyStream: func(userID UserID, spotifyClient SpotifyAPIClient, interval time.Duration, typetalkClient TypetalkAPIClient, spaceKeys []string, renewSpotifyClient func() (SpotifyAPIClient, error), renewTypetalkClient func() (TypetalkAPIClient, error)) IStream {
+				return &Stream{
+					Conn:     spotifyClient,
+					Interval: interval,
+					Handler: &SpotifyStreamHandler{
+						tc:        typetalkClient,
+						spaceKeys: spaceKeys,
+						emoji:     ":musical_note:",
+						renewClient: func() (TypetalkAPIClient, error) {
+							tc, err := renewTypetalkClient()
+
+							if err != nil {
+								return nil, err
+							}
+
+							return tc, nil
+						},
+					},
+					LoggerFunc: printError,
+					RenewSpotifyClient: func() (SpotifyAPIClient, error) {
+						sc, err := renewSpotifyClient()
+
+						if err != nil {
+							return nil, err
+						}
+
+						return sc, nil
+					},
+				}
+
+			},
+		}
+		handlers := NewHandlers(typetalkAuth, spotifyAuth, generator, ctx.String("JWT_SECRET"), &store)
 
 		authMid := authMiddleware(ctx.String("JWT_SECRET"))
 
@@ -201,6 +245,43 @@ func ForContext(ctx context.Context) int {
 	return int(raw)
 }
 
+type typetalkApiClient struct{ client *typetalk.Client }
+
+func (t *typetalkApiClient) GetMyOrganizations(ctx context.Context, excludesGuest bool) ([]*typetalk.Organization, *shared.Response, error) {
+	return t.client.Organizations.GetMyOrganizations(context.Background(), true)
+}
+func (t *typetalkApiClient) SaveUserStatus(ctx context.Context, spaceKey, emoji string, opt *typetalk.SaveUserStatusOptions) (*typetalk.SaveUserStatusResult, *shared.Response, error) {
+	return t.client.Statuses.SaveUserStatus(ctx, spaceKey, emoji, opt)
+}
+func (t *typetalkApiClient) PostMessage(ctx context.Context, topicID int, message string, opt *typetalk.PostMessageOptions) (*typetalk.PostedMessageResult, *shared.Response, error) {
+	return t.client.Messages.PostMessage(ctx, topicID, message, opt)
+}
+
+func (t *typetalkApiClient) GetProfileTypetalk(token *oauth2.Token) (*MyProfile, error) {
+	// go-typetalk doesn't work on profile api
+	// After go-typetalk will fix it, it'll be replaced
+	url := "https://typetalk.com/api/v1/profile"
+
+	var bearer = "Bearer " + token.AccessToken
+
+	req, err := http.NewRequest("GET", url, nil)
+
+	req.Header.Add("Authorization", bearer)
+
+	// Send req using http Client
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		printError("Cannot get profile of typetalk", err)
+	}
+
+	var myProfile *MyProfile
+
+	err = json.NewDecoder(resp.Body).Decode(&myProfile)
+
+	return myProfile, err
+}
+
 func saveSpotifyTokenToFile(dir string, token *oauth2.Token) error {
 	blob, err := json.Marshal(token)
 	if err != nil {
@@ -222,10 +303,11 @@ func newSpotify(auth *spotify.Authenticator, token *oauth2.Token) (*spotify.Clie
 }
 
 type SpotifyStreamHandler struct {
-	tc        *typetalk.Client
-	emoji     string
-	spaceKeys []string
-	topics    []int
+	tc          TypetalkAPIClient
+	renewClient func() (TypetalkAPIClient, error)
+	emoji       string
+	spaceKeys   []string
+	topics      []int
 }
 
 func (h *SpotifyStreamHandler) Serve(playing *spotify.CurrentlyPlaying) {
@@ -246,7 +328,7 @@ func (h *SpotifyStreamHandler) Serve(playing *spotify.CurrentlyPlaying) {
 	printDebug("NOW PLAYING", "-", msg)
 
 	for _, v := range h.spaceKeys {
-		_, _, err := h.tc.Statuses.SaveUserStatus(context.Background(),
+		_, _, err := h.tc.SaveUserStatus(context.Background(),
 			v, ":musical_note:", &typetalk.SaveUserStatusOptions{
 				Message:                msg,
 				ClearAt:                "",
@@ -254,6 +336,12 @@ func (h *SpotifyStreamHandler) Serve(playing *spotify.CurrentlyPlaying) {
 			})
 		if err != nil {
 			printError(err)
+			newClient, err := h.renewClient()
+			if err != nil {
+				printError("Cannot renew typetalk client access key", err)
+				return
+			}
+			h.tc = newClient
 		}
 
 	}
@@ -265,7 +353,8 @@ func (h *SpotifyStreamHandler) postTopic(topicID int, playing *spotify.Currently
 	// eg. Retarded/KID FRESINO - ai qing [ ](https://i.scdn.co/image/ab67616d0000b273b3ca13afd5b1315924854ce7)
 	metadata := generateMetadata(playing, &metadataOption{trackInfo: true, albumName: true, albumImage: true, short: false})
 	msg := fmt.Sprintf("%s %s\n%s", h.emoji, metadata, externalURL)
-	_, _, err := h.tc.Messages.PostMessage(context.Background(), topicID, msg, &typetalk.PostMessageOptions{})
+	// _, _, err := h.tc.Messages.PostMessage(context.Background(), topicID, msg, &typetalk.PostMessageOptions{})
+	_, _, err := h.tc.PostMessage(context.Background(), topicID, msg, &typetalk.PostMessageOptions{})
 	if err != nil {
 		printError(err)
 	}

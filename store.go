@@ -53,7 +53,7 @@ func (s *store) SaveTypetalkAccount(typetalkAccountID int, token *oauth2.Token) 
 	_, err = tx.Exec(`INSERT INTO oauth2 (user_id, access_token, refresh_token, expire_time, provider) VALUES($1,$2,$3,$4,'typetalk')
 		ON CONFLICT (user_id, provider)
 		DO
-		UPDATE SET (access_token, refresh_token, expire_time) = ($2,$3,$4)`, userID, token.AccessToken, token.RefreshToken, token.Expiry)
+		UPDATE SET (access_token, refresh_token, expire_time, updated_at) = ($2,$3,$4,$5)`, userID, token.AccessToken, token.RefreshToken, token.Expiry, time.Now())
 
 	if err != nil {
 		tx.Rollback()
@@ -86,7 +86,7 @@ func (s *store) updateTokenByProvider(userID UserID, token *oauth2.Token, provid
 	_, err := s.db.Exec(`INSERT INTO oauth2 (user_id, access_token, refresh_token, expire_time, provider) VALUES($1,$2,$3,$4,$5)
 		ON CONFLICT (user_id, provider)
 		DO
-		UPDATE SET (access_token, refresh_token, expire_time) = ($2,$3,$4)`, userID, token.AccessToken, token.RefreshToken, token.Expiry, provider)
+		UPDATE SET (access_token, refresh_token, expire_time, updated_at) = ($2,$3,$4,$6)`, userID, token.AccessToken, token.RefreshToken, token.Expiry, provider, time.Now())
 
 	if err != nil {
 		printError(fmt.Sprintf("Cannot update oauth2 of %s", provider), err)
@@ -123,6 +123,6 @@ func (s *store) getOauthTokenByProvider(userID UserID, provider string) (*oauth2
 	return &oauth2.Token{
 		AccessToken:  typetalkAccessToken,
 		RefreshToken: typetalkRefreshToken,
-		Expiry:       expireTime,
+		Expiry:       TimeLocal(expireTime, ""),
 	}, nil
 }

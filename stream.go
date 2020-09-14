@@ -1,5 +1,10 @@
 package main
 
+/*
+	Code adapted from vvatanabe's one:
+	https://github.com/vvatanabe/spotify-playing-stream
+*/
+
 import (
 	"context"
 	"errors"
@@ -20,15 +25,14 @@ const (
 
 var (
 	ErrStreamSubscribed = errors.New(name + " subscribed")
-	finishCh            = make(chan int)
 )
 
 type Stream struct {
-	Conn        *spotify.Client
-	Handler     Handler
-	Interval    time.Duration
-	LoggerFunc  LoggerFunc
-	ReNewClient func() (*spotify.Client, error)
+	Conn               SpotifyAPIClient
+	Handler            Handler
+	Interval           time.Duration
+	LoggerFunc         LoggerFunc
+	RenewSpotifyClient func() (SpotifyAPIClient, error)
 
 	started         int32
 	inShutdown      int32
@@ -37,10 +41,12 @@ type Stream struct {
 	activePlayingWg sync.WaitGroup
 	doneChan        chan struct{}
 	onShutdown      []func()
+	finishCh        chan int
 }
 
 func (s *Stream) Subscribe() error {
 
+	s.finishCh = make(chan int)
 	if atomic.LoadInt32(&s.started) == 1 {
 		return ErrStreamSubscribed
 	}
@@ -56,58 +62,53 @@ func (s *Stream) Subscribe() error {
 	tokenExpierErrCnt := 0
 	var preTrackID string
 	for {
-		// This loop is stopped
-		select {
-		case <-finishCh:
-			return nil
-		default:
-			player, err := spotifyClient.PlayerCurrentlyPlaying()
-			log.Println("Spotify streaming is working")
-			if err != nil {
-				if err != io.EOF {
-					s.log(err)
-				}
-				serr, ok := err.(spotify.Error)
-
-				if !ok {
-					log.Fatalf("Expected spotify Error, got %T", err)
-				}
-
-				// If token is expired, try to renew client
-				if serr.Status == http.StatusUnauthorized {
-					spotifyClient, err = s.ReNewClient()
-					tokenExpierErrCnt += 1
-
-					if tokenExpierErrCnt > 3 {
-						return nil
-					}
-
-					if err != nil {
-						return err
-					}
-					continue
-				}
-
-				return err
+		player, err := spotifyClient.PlayerCurrentlyPlaying()
+		log.Println("Spotify streaming is working")
+		if err != nil {
+			if err != io.EOF {
+				s.log(err)
 			}
-			tokenExpierErrCnt = 0
+			serr, ok := err.(spotify.Error)
 
-			if !player.Playing || player.Item == nil {
-				preTrackID = ""
-				time.Sleep(interval)
+			if !ok {
+				log.Fatalf("Expected spotify Error, got %T", err)
+			}
+
+			// If token is expired, try to renew client
+			if serr.Status == http.StatusUnauthorized {
+				spotifyClient, err = s.RenewSpotifyClient()
+				tokenExpierErrCnt += 1
+
+				if tokenExpierErrCnt > 3 {
+					return nil
+				}
+
+				if err != nil {
+					return err
+				}
 				continue
 			}
 
-			curTrackID := player.Item.ID.String()
-			if preTrackID == curTrackID {
-				time.Sleep(interval)
-				continue
-			}
-			preTrackID = curTrackID
-
-			go s.handle(player)
-			time.Sleep(interval)
+			return err
 		}
+		tokenExpierErrCnt = 0
+
+		if !player.Playing || player.Item == nil {
+			preTrackID = ""
+			time.Sleep(interval)
+			continue
+		}
+
+		curTrackID := player.Item.ID.String()
+		log.Printf("Now playing %s", curTrackID)
+		if preTrackID == curTrackID {
+			time.Sleep(interval)
+			continue
+		}
+		preTrackID = curTrackID
+
+		go s.handle(player)
+		time.Sleep(interval)
 	}
 }
 
@@ -147,10 +148,6 @@ func (s *Stream) Shutdown(ctx context.Context) error {
 	case <-finished:
 		return nil
 	}
-}
-
-func (s *Stream) StopStreaming() {
-	finishCh <- 1
 }
 
 func (s *Stream) shuttingDown() bool {

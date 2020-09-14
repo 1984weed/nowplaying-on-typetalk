@@ -1,14 +1,22 @@
 package main
 
 import (
+	"database/sql/driver"
 	"fmt"
-	"reflect"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"golang.org/x/oauth2"
 )
+
+type AnyTime struct{}
+
+// Match satisfies sqlmock.Argument interface
+func (a AnyTime) Match(v driver.Value) bool {
+	_, ok := v.(time.Time)
+	return ok
+}
 
 func TestShouldSaveTypetalkUser(t *testing.T) {
 	db, mock, err := sqlmock.New()
@@ -27,7 +35,7 @@ func TestShouldSaveTypetalkUser(t *testing.T) {
 		AddRow(expectUserID)
 	mock.ExpectBegin()
 	mock.ExpectQuery("INSERT INTO users").WillReturnRows(rows)
-	mock.ExpectExec("INSERT INTO oauth2").WithArgs(2, 3).WithArgs(expectUserID, accessToken, refreshToken, expiry).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("INSERT INTO oauth2").WithArgs(2, 3).WithArgs(expectUserID, accessToken, refreshToken, expiry, AnyTime{}).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
 	store := NewStore(db)
@@ -88,7 +96,7 @@ func TestShouldGetTypetalkToken(t *testing.T) {
 	want := &oauth2.Token{
 		AccessToken:  "ACCESS_TOKEN",
 		RefreshToken: "REFRESH_TOKEN",
-		Expiry:       time.Now(),
+		Expiry:       time.Now().UTC(),
 	}
 
 	rows := sqlmock.NewRows([]string{"access_token", "refresh_token", "expire_time"}).
@@ -108,7 +116,13 @@ func TestShouldGetTypetalkToken(t *testing.T) {
 		t.Errorf("got is nil")
 	}
 
-	if !reflect.DeepEqual(got, want) {
+	if got.AccessToken != want.AccessToken {
+		t.Errorf("got [%v], want [%v] ", got, want)
+	}
+	if got.RefreshToken != want.RefreshToken {
+		t.Errorf("got [%v], want [%v] ", got, want)
+	}
+	if got.Expiry != TimeLocal(want.Expiry, "") {
 		t.Errorf("got [%v], want [%v] ", got, want)
 	}
 }
@@ -145,7 +159,7 @@ func TestShouldGetSpotifyToken(t *testing.T) {
 	want := &oauth2.Token{
 		AccessToken:  "ACCESS_TOKEN",
 		RefreshToken: "REFRESH_TOKEN",
-		Expiry:       time.Now(),
+		Expiry:       time.Now().UTC(),
 	}
 
 	rows := sqlmock.NewRows([]string{"access_token", "refresh_token", "expire_time"}).
@@ -165,7 +179,13 @@ func TestShouldGetSpotifyToken(t *testing.T) {
 		t.Errorf("got is nil")
 	}
 
-	if !reflect.DeepEqual(got, want) {
+	if got.AccessToken != want.AccessToken {
+		t.Errorf("got [%v], want [%v] ", got, want)
+	}
+	if got.RefreshToken != want.RefreshToken {
+		t.Errorf("got [%v], want [%v] ", got, want)
+	}
+	if got.Expiry != TimeLocal(want.Expiry, "") {
 		t.Errorf("got [%v], want [%v] ", got, want)
 	}
 }
@@ -183,7 +203,7 @@ func TestShouldUpdateTypetalkToken(t *testing.T) {
 	}
 
 	userID := 1
-	mock.ExpectExec("INSERT INTO oauth2").WithArgs(userID, sample.AccessToken, sample.RefreshToken, sample.Expiry, "typetalk").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("INSERT INTO oauth2").WithArgs(userID, sample.AccessToken, sample.RefreshToken, sample.Expiry, "typetalk", AnyTime{}).WillReturnResult(sqlmock.NewResult(1, 1))
 
 	store := NewStore(db)
 	err = store.UpdateTypetalkToken(userID, sample)
@@ -206,7 +226,7 @@ func TestShouldUpdateSpotifyToken(t *testing.T) {
 	}
 
 	userID := 1
-	mock.ExpectExec("INSERT INTO oauth2").WithArgs(userID, sample.AccessToken, sample.RefreshToken, sample.Expiry, "spotify").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("INSERT INTO oauth2").WithArgs(userID, sample.AccessToken, sample.RefreshToken, sample.Expiry, "spotify", AnyTime{}).WillReturnResult(sqlmock.NewResult(1, 1))
 
 	store := NewStore(db)
 	err = store.UpdateSpotifyToken(userID, sample)
